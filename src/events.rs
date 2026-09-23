@@ -1,0 +1,102 @@
+use crate::handler::data::{TighteningResult, TraceCurveData};
+use crate::job::JobRuntimeState;
+use crate::multi_spindle::{MultiSpindleResult, MultiSpindleStatus};
+use crate::tightening_tracker::OperationMode;
+use serde::{Deserialize, Serialize};
+use tokio::sync::broadcast;
+
+/// Events that can be broadcast to all connected clients
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
+#[allow(dead_code)]
+pub enum SimulatorEvent {
+    /// A tightening operation was completed
+    TighteningCompleted {
+        result: TighteningResult,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        torque_curve: Option<TraceCurveData>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        angle_curve: Option<TraceCurveData>,
+    },
+
+    /// A parameter set was selected
+    PsetChanged {
+        pset_id: u32,
+        pset_name: String,
+    },
+
+    /// Tool state changed (enabled/disabled)
+    ToolStateChanged {
+        enabled: bool,
+    },
+
+    /// Tool direction changed (CW/CCW)
+    ToolDirectionChanged {
+        direction: crate::state::ToolDirection,
+    },
+
+    /// Operation mode (command profile) changed
+    OperationModeChanged {
+        mode: OperationMode,
+    },
+
+    /// Batch was completed
+    BatchCompleted {
+        total: u32,
+    },
+
+    /// Vehicle ID was changed
+    VehicleIdChanged {
+        vin: String,
+    },
+
+    /// Multi-spindle status update completed
+    MultiSpindleStatusCompleted {
+        status: MultiSpindleStatus,
+    },
+
+    /// Multi-spindle tightening result completed
+    MultiSpindleResultCompleted {
+        result: MultiSpindleResult,
+        job_id: u32,
+        pset_id: u32,
+        batch_size: u32,
+        batch_counter: u32,
+        batch_status: u8,
+    },
+
+    /// Auto-tightening progress update
+    AutoTighteningProgress {
+        counter: u32,
+        target_size: u32,
+        running: bool,
+    },
+
+    JobSelected {
+        state: JobRuntimeState,
+    },
+    JobProgress {
+        state: JobRuntimeState,
+    },
+    JobStepChanged {
+        state: JobRuntimeState,
+        previous_step: u32,
+    },
+    JobRestarted {
+        state: JobRuntimeState,
+    },
+    JobCompleted {
+        state: JobRuntimeState,
+        repeated: bool,
+    },
+    JobAborted {
+        state: JobRuntimeState,
+    },
+}
+
+/// Type alias for the event broadcaster (sender side)
+pub type EventBroadcaster = broadcast::Sender<SimulatorEvent>;
+
+/// Type alias for event receivers (subscriber side)
+#[allow(dead_code)]
+pub type EventReceiver = broadcast::Receiver<SimulatorEvent>;

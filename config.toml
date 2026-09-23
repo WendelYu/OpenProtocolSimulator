@@ -1,0 +1,24 @@
+[server]
+tcp_port = 4545
+http_port = 8081
+bind_address = "0.0.0.0"
+event_channel_capacity = 100
+
+[webui]
+enabled = true
+host = "0.0.0.0"
+port = 8082
+
+[device]
+cell_id = 1
+channel_id = 1
+controller_name = "OpenProtocolSimulator"
+supplier_code = "SIM"
+
+[database]
+path = "simulator.db"
+
+[defaults]
+auto_tightening_interval_ms = 3000
+auto_tightening_duration_ms = 1500
+failure_rate = 0.1

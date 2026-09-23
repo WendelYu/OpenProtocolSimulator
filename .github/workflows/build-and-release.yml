@@ -1,0 +1,106 @@
+name: Build and Package Releases
+
+permissions:
+  contents: write
+
+on:
+  push:
+    branches: [ "main" ]
+    tags: [ "v*" ]
+  pull_request:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+jobs:
+  build-and-package:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            artifact_name: OpenProtocolSimulator-Windows-x86_64
+            binary_name: open-protocol-device-simulator.exe
+            archive_ext: zip
+          - os: macos-latest
+            artifact_name: OpenProtocolSimulator-macOS-ARM64
+            binary_name: open-protocol-device-simulator
+            archive_ext: tar.gz
+          - os: ubuntu-latest
+            artifact_name: OpenProtocolSimulator-Linux-x86_64
+            binary_name: open-protocol-device-simulator
+            archive_ext: tar.gz
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install Frontend Dependencies
+        working-directory: frontend
+        run: |
+          npm ci || npm install
+          npx svelte-kit sync
+
+      - name: Setup Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build Release Binary
+        run: cargo build --release
+
+      - name: Setup Python
+        if: runner.os == 'Windows'
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Build Standalone GUI Executable (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          pip install pyinstaller
+          pyinstaller --noconfirm --onefile --windowed --name OpenProtocolSimulator-GUI simulator_gui.py
+
+      - name: Prepare Package Directory (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          mkdir -p package_dist/bin
+          cp target/release/${{ matrix.binary_name }} package_dist/bin/
+          if [ -f "dist/OpenProtocolSimulator-GUI.exe" ]; then cp dist/OpenProtocolSimulator-GUI.exe package_dist/; fi
+          cp simulator_gui.py package_dist/
+          cp quick_test_client.py package_dist/
+          cp config.toml package_dist/
+          cp 启动模拟器.bat package_dist/
+          cp start.bat package_dist/
+          cd package_dist && 7z a ../${{ matrix.artifact_name }}.zip .
+
+      - name: Prepare Package Directory (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          mkdir -p dist/bin
+          cp target/release/${{ matrix.binary_name }} dist/bin/
+          cp simulator_gui.py dist/
+          cp quick_test_client.py dist/
+          cp config.toml dist/
+          if [ -f "启动模拟器.command" ]; then cp 启动模拟器.command dist/; fi
+          chmod +x dist/bin/* dist/*.command 2>/dev/null || true
+          tar -czvf ${{ matrix.artifact_name }}.tar.gz -C dist .
+
+      - name: Upload Build Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: ${{ matrix.artifact_name }}.${{ matrix.archive_ext }}
+
+      - name: Release to GitHub Releases
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ matrix.artifact_name }}.${{ matrix.archive_ext }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -1,0 +1,747 @@
+use futures_util::sink::SinkExt;
+use futures_util::stream::StreamExt;
+use open_protocol_device_simulator::{
+    codec, config, events, failure_simulator, handler, http_server, observable_state, protocol,
+    session, state, webui,
+};
+use std::sync::Arc;
+use thiserror::Error;
+
+use config::Settings;
+use events::SimulatorEvent;
+use failure_simulator::FailureSimulator;
+use observable_state::ObservableState;
+use protocol::revision::ProtocolConfiguration;
+use state::DeviceState;
+
+fn is_ack_only_mid(mid: u16) -> bool {
+    matches!(mid, 16 | 53 | 62 | 93 | 102 | 218)
+}
+
+fn relay_active(observable_state: &ObservableState, relay_number: u16) -> Option<bool> {
+    let state = observable_state.read();
+    match relay_number {
+        20 => Some(state.tool_start_switch_active),
+        22 => Some(state.direction_ccw_relay_active()),
+        _ => None,
+    }
+}
+
+fn build_relay_function_broadcast(
+    observable_state: &ObservableState,
+    relay_number: u16,
+) -> Option<protocol::Response> {
+    let active = relay_active(observable_state, relay_number)?;
+    Some(protocol::Response::from_data(
+        217,
+        1,
+        handler::data::RelayFunction::new(relay_number, active),
+    ))
+}
+
+/// Send a message with failure injection
+/// Returns Ok(true) if message was sent, Ok(false) if dropped, Err if connection should close
+async fn send_with_failure_injection(
+    framed: &mut tokio_util::codec::Framed<
+        tokio::net::TcpStream,
+        codec::null_delimited_codec::NullDelimitedCodec,
+    >,
+    message_bytes: Vec<u8>,
+    observable_state: &ObservableState,
+    context: &str,
+) -> Result<bool, std::io::Error> {
+    // Read failure config from device state
+    let failure_config = {
+        let state = observable_state.read();
+        state.failure_config.clone()
+    };
+
+    // Check if failure injection is enabled
+    if !failure_config.enabled {
+        return framed
+            .send(message_bytes.as_slice().into())
+            .await
+            .map(|_| true);
+    }
+
+    // Make all random decisions first (before any awaits to avoid Send issues with ThreadRng)
+    let (should_disconnect, should_drop, delay, should_corrupt, bytes_to_send) = {
+        let mut simulator = FailureSimulator::new(failure_config.clone());
+
+        // Make all decisions
+        let disconnect = simulator.should_disconnect();
+        let drop_packet = simulator.should_drop_packet();
+        let delay = simulator.get_delay();
+        let corrupt = simulator.should_corrupt_message();
+
+        let bytes = if corrupt {
+            simulator.corrupt_message(&message_bytes)
+        } else {
+            message_bytes
+        };
+
+        // Drop simulator here (before any awaits)
+        (disconnect, drop_packet, delay, corrupt, bytes)
+    };
+
+    // Now handle the decisions (simulator is dropped, safe to await)
+    if should_disconnect {
+        println!("[FAILURE INJECTION] Force disconnect during: {}", context);
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::ConnectionAborted,
+            "Simulated connection drop",
+        ));
+    }
+
+    if should_drop {
+        println!("[FAILURE INJECTION] Packet dropped: {}", context);
+        return Ok(false);
+    }
+
+    if delay.as_millis() > 0 {
+        println!(
+            "[FAILURE INJECTION] Delaying {}ms before: {}",
+            delay.as_millis(),
+            context
+        );
+        tokio::time::sleep(delay).await;
+    }
+
+    if should_corrupt {
+        println!("[FAILURE INJECTION] Corrupting message: {}", context);
+    }
+
+    framed.send(bytes_to_send.as_slice().into()).await?;
+    Ok(true)
+}
+
+#[tokio::main]
+async fn main() {
+    let settings = config::load_config().expect("Failed to load configuration");
+    serve_tcp_client(settings).await.unwrap();
+}
+
+async fn serve_tcp_client(settings: Settings) -> Result<(), ServeError> {
+    let bind_addr = format!(
+        "{}:{}",
+        settings.server.bind_address, settings.server.tcp_port
+    );
+    let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
+
+    println!("Open Protocol TCP server listening on {}", bind_addr);
+
+    if settings.webui.enabled {
+        let webui_config = settings.webui.clone();
+        tokio::spawn(async move {
+            if let Err(error) = webui::start_server(webui_config).await {
+                eprintln!("Embedded WebUI server error: {error}");
+            }
+        });
+    }
+
+    // Create device state from configuration (shared across all connections)
+    let device_state = DeviceState::new_shared_from_config(&settings.device);
+
+    // Create event broadcast channel
+    let (event_tx, _event_rx) =
+        tokio::sync::broadcast::channel::<SimulatorEvent>(settings.server.event_channel_capacity);
+
+    // Create observable state wrapper that broadcasts events on state changes
+    let observable_state = ObservableState::new(device_state, event_tx.clone());
+
+    let db_path = settings.database.path.to_str().unwrap_or("simulator.db");
+    let pset_repository = open_protocol_device_simulator::pset::create_sqlite_repository(db_path)
+        .unwrap_or_else(|error| {
+            eprintln!("Failed to initialize SQLite PSET repository: {error}");
+            open_protocol_device_simulator::pset::create_default_repository()
+        });
+    let job_repository = open_protocol_device_simulator::job::create_sqlite_repository(db_path)
+        .unwrap_or_else(|error| {
+            eprintln!("Failed to initialize SQLite Job repository: {error}");
+            open_protocol_device_simulator::job::create_default_repository()
+        });
+    let protocol_configuration =
+        ProtocolConfiguration::persistent(db_path).unwrap_or_else(|error| {
+            eprintln!("Failed to initialize protocol profile storage: {error}");
+            ProtocolConfiguration::default()
+        });
+
+    // Spawn HTTP server for state inspection and event generation
+    let http_observable = observable_state.clone();
+    let http_settings = settings.clone();
+    let http_psets = pset_repository.clone();
+    let http_jobs = job_repository.clone();
+    let http_protocol_configuration = protocol_configuration.clone();
+    tokio::spawn(async move {
+        http_server::start_http_server_with_repositories_and_protocol(
+            http_observable,
+            http_settings,
+            http_psets,
+            http_jobs,
+            http_protocol_configuration,
+        )
+        .await;
+    });
+
+    // Create handler registry (shared across all connections)
+    let registry = Arc::new(handler::create_registry_with_repositories_and_protocol(
+        observable_state.clone(),
+        pset_repository.clone(),
+        job_repository,
+        protocol_configuration.clone(),
+    ));
+
+    loop {
+        let (stream, addr) = listener.accept().await?;
+        println!("Incoming connection from {}", addr);
+
+        let registry = Arc::clone(&registry);
+        let conn_observable_state = observable_state.clone();
+        let conn_protocol_configuration = protocol_configuration.clone();
+        let conn_pset_repository = pset_repository.clone();
+        let mut event_rx = event_tx.subscribe();
+        tokio::spawn(async move {
+            let codec = codec::null_delimited_codec::NullDelimitedCodec::new();
+            let mut framed = tokio_util::codec::Framed::new(stream, codec);
+
+            // Create connection session with typestate pattern
+            // Transitions: Disconnected → Connected → Ready
+            let session = session::ConnectionSession::new();
+            let session = session.connect(addr);
+            let mut session = session.authenticate(); // Immediate transition to Ready state
+
+            loop {
+                tokio::select! {
+                    // Handle incoming TCP messages (requests from client)
+                    Some(result) = framed.next() => {
+                        match result {
+                            Ok(raw_message) => {
+                                println!("Received: {:?}", raw_message);
+
+                                // Update keep-alive timestamp
+                                session.update_keep_alive();
+
+                                // Parse the message
+                                match protocol::parser::parse_message(&raw_message) {
+                                    Ok(message) => {
+                                        println!("Parsed MID {}, revision {}", message.mid, message.revision);
+
+                                        // Handle the message
+                                        match registry.dispatch(&message, session.subscriptions_mut()) {
+                                            Ok(handler::HandlerResult::Response(response)) => {
+                                                if is_ack_only_mid(message.mid) {
+                                                    println!(
+                                                        "MID {:04}: ACK received, no response sent",
+                                                        message.mid
+                                                    );
+                                                    continue;
+                                                }
+
+                                                if response.mid != 4 {
+                                                    session.apply_subscription_message(
+                                                        message.mid,
+                                                        message.revision,
+                                                    );
+                                                }
+                                                // Serialize and send response
+                                                let response_bytes = protocol::serializer::serialize_response(&response);
+                                                println!("Sending response: MID {}", response.mid);
+
+
+                                                match send_with_failure_injection(
+                                                    &mut framed,
+                                                    response_bytes,
+                                                    &conn_observable_state,
+                                                    &format!("MID {} response", response.mid),
+                                                ).await {
+                                                    Ok(false) => {
+                                                        // Packet was dropped, continue
+                                                    }
+                                                    Err(e) => {
+                                                        eprintln!("send error: {e}");
+                                                        break;
+                                                    }
+                                                    Ok(true) => {
+                                                        // Success
+                                                    }
+                                                }
+
+                                                // Special handling for MID 51 (vehicle ID subscription)
+                                                // Send VIN immediately after subscription is confirmed
+                                                if message.mid == 51 {
+                                                    // VIN is empty because handlers don't have direct state access
+                                                    // VIN changes are broadcast via SimulatorEvent::VehicleIdChanged
+                                                    let current_vin = conn_observable_state
+                                                        .read()
+                                                        .vehicle_id
+                                                        .clone()
+                                                        .unwrap_or_default();
+                                                    let revision = session
+                                                        .subscriptions()
+                                                        .vehicle_id_revision()
+                                                        .unwrap_or(1);
+                                                    let vin_data =
+                                                        handler::data::VehicleIdBroadcast::with_samples(
+                                                            current_vin.clone(),
+                                                            &conn_protocol_configuration.samples(),
+                                                        );
+                                                    let vin_response = protocol::Response::new(
+                                                        52,
+                                                        revision,
+                                                        vin_data.serialize_revision(revision),
+                                                    );
+                                                    let vin_response_bytes = protocol::serializer::serialize_response(&vin_response);
+                                                    println!("Sending initial MID 0052 with current VIN: {}", current_vin);
+
+                                                    match send_with_failure_injection(
+                                                        &mut framed,
+                                                        vin_response_bytes,
+                                                        &conn_observable_state,
+                                                        "MID 0052 initial VIN",
+                                                    ).await {
+                                                        Ok(false) => {}
+                                                        Err(e) => {
+                                                            eprintln!("send error during initial VIN broadcast: {e}");
+                                                            break;
+                                                        }
+                                                        Ok(true) => {}
+                                                    }
+                                                }
+                                                if message.mid == 14 {
+                                                    let revision = session
+                                                        .subscriptions()
+                                                        .pset_selection_revision()
+                                                        .unwrap_or(1);
+                                                    let (pset_id, batch_size) = {
+                                                        let state = conn_observable_state.read();
+                                                        (
+                                                            state.current_pset_id.unwrap_or(0),
+                                                            state.tightening_tracker.batch_size(),
+                                                        )
+                                                    };
+                                                    let pset = {
+                                                        conn_pset_repository
+                                                            .read()
+                                                            .unwrap()
+                                                            .get_by_id(pset_id)
+                                                    };
+                                                    if let Some(pset) = pset {
+                                                        let pset_data =
+                                                            handler::data::PsetSelected::from_pset(
+                                                                &pset,
+                                                                batch_size,
+                                                            );
+                                                        let pset_response =
+                                                            protocol::Response::new(
+                                                                15,
+                                                                revision,
+                                                                pset_data
+                                                                    .serialize_revision(revision),
+                                                            );
+                                                        let response_bytes =
+                                                            protocol::serializer::serialize_response(
+                                                                &pset_response,
+                                                            );
+                                                        if let Err(error) =
+                                                            send_with_failure_injection(
+                                                                &mut framed,
+                                                                response_bytes,
+                                                                &conn_observable_state,
+                                                                "MID 0015 initial PSET",
+                                                            )
+                                                            .await
+                                                        {
+                                                            eprintln!(
+                                                                "send error during initial PSET broadcast: {error}"
+                                                            );
+                                                            break;
+                                                        }
+                                                    }
+                                                }
+                                                if message.mid == 216 {
+                                                    let relay = handler::relay_function_subscribe::parse_relay_function(&message)
+                                                        .unwrap_or(22);
+                                                    session.subscribe_relay_function(relay);
+                                                    if let Some(response) = build_relay_function_broadcast(&conn_observable_state, relay) {
+                                                        let response_bytes = protocol::serializer::serialize_response(&response);
+                                                        println!("Sending initial MID 0217 for relay {relay} to subscribed client ({})", session.addr());
+                                                        if let Err(error) = send_with_failure_injection(
+                                                            &mut framed,
+                                                            response_bytes,
+                                                            &conn_observable_state,
+                                                            "MID 0217 initial relay function",
+                                                        ).await {
+                                                            eprintln!("send error during initial relay broadcast: {error}");
+                                                            break;
+                                                        }
+                                                    }
+                                                }
+                                            }
+
+                                            Ok(handler::HandlerResult::NoResponse) => {
+                                                println!("MID {} acknowledged without response", message.mid);
+                                            }
+                                            Err(e) => {
+                                                eprintln!("Handler error: {e}");
+                                                // Send error response (MID 0004)
+                                                let error_response = handler::data::ErrorResponse::generic(message.mid);
+                                                let response = protocol::Response::from_data(4, message.revision, error_response);
+                                                let response_bytes = protocol::serializer::serialize_response(&response);
+                                                println!("Sending error response: MID 0004 for failed MID {}", message.mid);
+
+                                                match send_with_failure_injection(
+                                                    &mut framed,
+                                                    response_bytes,
+                                                    &conn_observable_state,
+                                                    &format!("MID 0004 error for MID {}", message.mid),
+                                                ).await {
+                                                    Ok(false) => {}
+                                                    Err(e) => {
+                                                        eprintln!("send error: {e}");
+                                                        break;
+                                                    }
+                                                    Ok(true) => {}
+                                                }
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        eprintln!("Parse error: {e}");
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!("framed read error: {e}");
+                                break;
+                            }
+                        }
+                    }
+
+                    // Handle broadcast events (push notifications)
+                    Ok(event) = event_rx.recv() => {
+                        match event {
+                            SimulatorEvent::TighteningCompleted { result, torque_curve, angle_curve } => {
+                                if let Some(revision) =
+                                    session.subscriptions().tightening_result_revision()
+                                {
+                                    println!("Broadcasting MID 0061 to subscribed client ({})", session.addr());
+                                    let response = protocol::Response::new(
+                                        61,
+                                        revision,
+                                        result.serialize_revision(
+                                            revision,
+                                            &conn_protocol_configuration.samples(),
+                                        ),
+                                    );
+                                    let response_bytes = protocol::serializer::serialize_response(&response);
+
+                                    match send_with_failure_injection(
+                                        &mut framed,
+                                        response_bytes,
+                                        &conn_observable_state,
+                                        "MID 0061 tightening broadcast",
+                                    ).await {
+                                        Ok(false) => {}
+                                        Err(e) => {
+                                            eprintln!("send error during broadcast: {e}");
+                                            break;
+                                        }
+                                        Ok(true) => {}
+                                    }
+                                }
+
+                                // If client subscribed to MID 0900 trace curve, broadcast curve message
+                                if session.subscriptions().is_subscribed_to_trace_curve() {
+                                    let rev = session.subscriptions().trace_curve_revision().unwrap_or(1);
+                                    let trace_type = session.subscriptions().trace_curve_type;
+                                    println!("Broadcasting MID 0900 (Trace Curve, type: {}) to subscribed client ({})", trace_type, session.addr());
+
+                                    let (t_curve, a_curve) = match (torque_curve, angle_curve) {
+                                        (Some(tc), Some(ac)) => (tc, ac),
+                                        _ => handler::data::TraceCurveData::generate_curves(
+                                            result.tightening_id.unwrap_or(1) as u64,
+                                            &result.timestamp,
+                                            result.torque_target,
+                                            result.torque,
+                                            result.angle,
+                                            result.tightening_status,
+                                        ),
+                                    };
+
+                                    let curve = if trace_type == 1 { a_curve } else { t_curve };
+                                    let curve_bytes = curve.serialize_mid_0900(rev as u8);
+
+                                    match send_with_failure_injection(
+                                        &mut framed,
+                                        curve_bytes,
+                                        &conn_observable_state,
+                                        "MID 0900 trace curve broadcast",
+                                    ).await {
+                                        Ok(false) => {}
+                                        Err(e) => {
+                                            eprintln!("send error during MID 0900 broadcast: {e}");
+                                            break;
+                                        }
+                                        Ok(true) => {}
+                                    }
+                                }
+                            }
+                            SimulatorEvent::PsetChanged { pset_id, pset_name: _ } => {
+                                if let Some(revision) =
+                                    session.subscriptions().pset_selection_revision()
+                                {
+                                    println!("Broadcasting MID 0015 to subscribed client ({}): pset {}", session.addr(), pset_id);
+                                    let batch_size = conn_observable_state
+                                        .read()
+                                        .tightening_tracker
+                                        .batch_size();
+                                    let pset = {
+                                        conn_pset_repository
+                                            .read()
+                                            .unwrap()
+                                            .get_by_id(pset_id)
+                                    };
+                                    let Some(pset) = pset else {
+                                        eprintln!("Cannot broadcast MID 0015: PSET {pset_id} not found");
+                                        continue;
+                                    };
+                                    let pset_data =
+                                        handler::data::PsetSelected::from_pset(&pset, batch_size);
+                                    let response = protocol::Response::new(
+                                        15,
+                                        revision,
+                                        pset_data.serialize_revision(revision),
+                                    );
+                                    let response_bytes = protocol::serializer::serialize_response(&response);
+
+                                    match send_with_failure_injection(
+                                        &mut framed,
+                                        response_bytes,
+                                        &conn_observable_state,
+                                        "MID 0015 PSET broadcast",
+                                    ).await {
+                                        Ok(false) => {}
+                                        Err(e) => {
+                                            eprintln!("send error during broadcast: {e}");
+                                            break;
+                                        }
+                                        Ok(true) => {}
+                                    }
+                                }
+                            }
+                            SimulatorEvent::ToolStateChanged { .. } => {
+                                // No standard MID for tool state broadcasts in Open Protocol
+                            }
+                            SimulatorEvent::ToolDirectionChanged { direction } => {
+                                println!("Tool direction changed: {:?}", direction);
+                                if session
+                                    .subscriptions()
+                                    .is_subscribed_to_relay_function(22)
+                                {
+                                    let Some(response) =
+                                        build_relay_function_broadcast(&conn_observable_state, 22)
+                                    else {
+                                        continue;
+                                    };
+                                    let response_bytes =
+                                        protocol::serializer::serialize_response(&response);
+                                    println!(
+                                        "Broadcasting MID 0217 to subscribed client ({}) for relay 22 ({:?})",
+                                        session.addr(),
+                                        direction
+                                    );
+
+                                    match send_with_failure_injection(
+                                        &mut framed,
+                                        response_bytes,
+                                        &conn_observable_state,
+                                        "MID 0217 relay function broadcast",
+                                    )
+                                    .await
+                                    {
+                                        Ok(false) => {}
+                                        Err(e) => {
+                                            eprintln!("send error during broadcast: {e}");
+                                            break;
+                                        }
+                                        Ok(true) => {}
+                                    }
+                                }
+                            }
+                            SimulatorEvent::OperationModeChanged { .. } => {
+
+                                // Simulator profile change; only relevant to the web UI
+                            }
+                            SimulatorEvent::BatchCompleted { total } => {
+                                println!("Batch completed: {} tightenings", total);
+                                // Could send MID 0061 with batch status if subscribed
+                            }
+                            SimulatorEvent::VehicleIdChanged { vin } => {
+                                if let Some(revision) =
+                                    session.subscriptions().vehicle_id_revision()
+                                {
+                                    println!("Broadcasting MID 0052 to subscribed client ({}): VIN {}", session.addr(), vin);
+                                    let vin_data =
+                                        handler::data::VehicleIdBroadcast::with_samples(
+                                            vin,
+                                            &conn_protocol_configuration.samples(),
+                                        );
+                                    let response = protocol::Response::new(
+                                        52,
+                                        revision,
+                                        vin_data.serialize_revision(revision),
+                                    );
+                                    let response_bytes = protocol::serializer::serialize_response(&response);
+
+                                    match send_with_failure_injection(
+                                        &mut framed,
+                                        response_bytes,
+                                        &conn_observable_state,
+                                        "MID 0052 VIN broadcast",
+                                    ).await {
+                                        Ok(false) => {}
+                                        Err(e) => {
+                                            eprintln!("send error during broadcast: {e}");
+                                            break;
+                                        }
+                                        Ok(true) => {}
+                                    }
+                                }
+                            }
+                            SimulatorEvent::MultiSpindleStatusCompleted { status } => {
+                                if let Some(revision) =
+                                    session.subscriptions().multi_spindle_status_revision()
+                                {
+                                    println!("Broadcasting MID 0091 to subscribed client ({}): sync_id {}, status {}",
+                                        session.addr(), status.sync_id, status.status);
+                                    let status_data = handler::data::MultiSpindleStatusBroadcast::new(status);
+                                    let response = protocol::Response::from_data(91, revision, status_data);
+                                    let response_bytes = protocol::serializer::serialize_response(&response);
+
+                                    match send_with_failure_injection(
+                                        &mut framed,
+                                        response_bytes,
+                                        &conn_observable_state,
+                                        "MID 0091 multi-spindle status broadcast",
+                                    ).await {
+                                        Ok(false) => {}
+                                        Err(e) => {
+                                            eprintln!("send error during broadcast: {e}");
+                                            break;
+                                        }
+                                        Ok(true) => {}
+                                    }
+                                }
+                            }
+                            SimulatorEvent::MultiSpindleResultCompleted {
+                                result,
+                                job_id,
+                                pset_id,
+                                batch_size,
+                                batch_counter,
+                                batch_status,
+                            } => {
+                                if let Some(revision) =
+                                    session.subscriptions().multi_spindle_result_revision()
+                                {
+                                    println!("Broadcasting MID 0101 to subscribed client ({}): result_id {}, sync_id {}, status {}",
+                                        session.addr(), result.result_id, result.sync_id,
+                                        if result.is_ok() { "OK" } else { "NOK" });
+
+                                    // Create MID 0101 broadcast with multi-spindle result data
+                                    let result_data = handler::data::MultiSpindleResultBroadcast::new(
+                                        result,
+                                        conn_observable_state
+                                            .read()
+                                            .vehicle_id
+                                            .clone()
+                                            .unwrap_or_default(),
+                                        job_id,
+                                        pset_id,
+                                        batch_size,
+                                        batch_counter,
+                                        batch_status,
+                                    );
+                                    let response = protocol::Response::new(
+                                        101,
+                                        revision,
+                                        result_data.serialize_revision(
+                                            revision,
+                                            &conn_protocol_configuration.samples(),
+                                        ),
+                                    );
+                                    let response_bytes = protocol::serializer::serialize_response(&response);
+
+                                    match send_with_failure_injection(
+                                        &mut framed,
+                                        response_bytes,
+                                        &conn_observable_state,
+                                        "MID 0101 multi-spindle result broadcast",
+                                    ).await {
+                                        Ok(false) => {}
+                                        Err(e) => {
+                                            eprintln!("send error during broadcast: {e}");
+                                            break;
+                                        }
+                                        Ok(true) => {}
+                                    }
+                                }
+                            }
+                            SimulatorEvent::AutoTighteningProgress { .. } => {
+                                // Auto-tightening progress is only sent to WebSocket clients, not TCP
+                                // No MID exists in Open Protocol for auto-tightening progress
+                            }
+                            SimulatorEvent::JobSelected { state }
+                            | SimulatorEvent::JobProgress { state }
+                            | SimulatorEvent::JobRestarted { state } => {
+                                if let Some(revision) = session.subscriptions().job_info_revision()
+                                    && let Some(codec) =
+                                        open_protocol_device_simulator::job_codec::codec_for_revision(revision)
+                                {
+                                    match codec.serialize_job_info(
+                                        &state,
+                                        &conn_protocol_configuration.samples(),
+                                    ) {
+                                        Ok(data) => {
+                                            let response = protocol::Response::new(35, revision, data);
+                                            let response_bytes =
+                                                protocol::serializer::serialize_response(&response);
+                                            if let Err(error) = send_with_failure_injection(
+                                                &mut framed,
+                                                response_bytes,
+                                                &conn_observable_state,
+                                                "MID 0035 Job info broadcast",
+                                            )
+                                            .await
+                                            {
+                                                eprintln!("send error during Job broadcast: {error}");
+                                                break;
+                                            }
+                                        }
+                                        Err(error) => {
+                                            eprintln!("Failed to serialize MID 0035: {error}");
+                                        }
+                                    }
+                                }
+                            }
+                            SimulatorEvent::JobStepChanged { .. }
+                            | SimulatorEvent::JobCompleted { .. }
+                            | SimulatorEvent::JobAborted { .. } => {
+                                // Frontend-specific typed events. MID 0035 is emitted by JobProgress;
+                                // Abort Job is answered to the TCP client by its MID 0005 ACK.
+                            }
+                        }
+                    }
+                }
+            }
+            // This runs when the loop exits (disconnect)
+            println!("Client disconnected: {}", session.addr());
+        });
+    }
+}
+
+#[derive(Error, Debug)]
+pub enum ServeError {
+    #[error("IO error: {0}")]
+    Io(#[from] std::io::Error),
+}

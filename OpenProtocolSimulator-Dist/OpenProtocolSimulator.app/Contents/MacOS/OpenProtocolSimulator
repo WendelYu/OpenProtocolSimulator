@@ -1,0 +1,39 @@
+#!/bin/bash
+ROOT_DIR="$(cd "$(dirname "$0")/../../.." && pwd)"
+
+if [ -f "$ROOT_DIR/simulator_gui.py" ]; then
+    GUI_SCRIPT="$ROOT_DIR/simulator_gui.py"
+    BIN="$ROOT_DIR/bin/open-protocol-device-simulator"
+    CFG="$ROOT_DIR/config.toml"
+else
+    GUI_SCRIPT="$ROOT_DIR/open-protocol-device-simulator/simulator_gui.py"
+    BIN="$ROOT_DIR/open-protocol-device-simulator/bin/open-protocol-device-simulator"
+    CFG="$ROOT_DIR/open-protocol-device-simulator/config.toml"
+fi
+
+export PATH="/Library/Frameworks/Python.framework/Versions/Current/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
+
+PYTHON_BIN=""
+for py in "/Library/Frameworks/Python.framework/Versions/3.13/bin/python3" \
+          "/Library/Frameworks/Python.framework/Versions/Current/bin/python3" \
+          "/usr/local/bin/python3" \
+          "/usr/bin/python3" \
+          "$(command -v python3 2>/dev/null)"; do
+    if [ -x "$py" ] && "$py" -c "import tkinter" >/dev/null 2>&1; then
+        PYTHON_BIN="$py"
+        break
+    fi
+done
+
+if [ -n "$PYTHON_BIN" ] && [ -f "$GUI_SCRIPT" ]; then
+    exec "$PYTHON_BIN" "$GUI_SCRIPT"
+fi
+
+# Fallback: 直接启动二进制并打开浏览器
+if [ -x "$BIN" ] && [ -f "$CFG" ]; then
+    "$BIN" --config "$CFG" &
+    SIM_PID=$!
+    sleep 1.5
+    open "http://localhost:8082"
+    wait $SIM_PID
+fi

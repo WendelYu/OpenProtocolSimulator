@@ -1,0 +1,30 @@
+// Library exports for integration testing
+pub mod batch_manager;
+pub mod codec;
+pub mod config;
+pub mod device_fsm;
+pub mod events;
+pub mod failure_simulator;
+pub mod handler;
+pub mod http_server;
+pub mod job;
+pub mod job_codec;
+pub mod multi_spindle;
+pub mod observable_state;
+pub mod protocol;
+pub mod pset;
+pub mod session;
+pub mod state;
+pub mod subscriptions;
+pub mod tightening_tracker;
+pub mod webui;
+
+// Re-export commonly used types
+pub use events::SimulatorEvent;
+pub use observable_state::ObservableState;
+pub use protocol::revision::{
+    MidFamilyDefinition, MidRevision, ProtocolConfiguration, ProtocolProfile, RevisionPolicy,
+    RevisionSelection,
+};
+pub use state::DeviceState;
+pub use tightening_tracker::OperationMode;
